@@ -42,6 +42,7 @@ export type DataStore = {
 	CompressedValue: string,
 	StateChanged: Signal.Signal,
 	Saving: Signal.Signal,
+	Saved: Signal.Signal,
 	AttemptsChanged: Signal.Signal,
 	ProcessQueue: Signal.Signal,
 	Open: (self: DataStore, template: any?) -> (string, any),
@@ -84,6 +85,7 @@ Constructor.new = function(name, scope, key)
 		CompressedValue = "",
 		StateChanged = Signal.new(),
 		Saving = Signal.new(),
+		Saved = Signal.new(),
 		AttemptsChanged = Signal.new(),
 		ProcessQueue = Signal.new(),
 	})
@@ -126,6 +128,7 @@ Constructor.hidden = function(name, scope, key)
 		CompressedValue = "",
 		StateChanged = Signal.new(),
 		Saving = Signal.new(),
+		Saved = Signal.new(),
 		AttemptsChanged = Signal.new(),
 		ProcessQueue = Signal.new(),
 	})
@@ -332,6 +335,7 @@ DataStore.__set = {
 	CompressedValue = false,
 	StateChanged = false,
 	Saving = false,
+	Saved = false,
 	AttemptsChanged = false,
 	ProcessQueue = false,
 }
@@ -342,10 +346,10 @@ DataStore.__set = {
 -- Functions
 OpenTask = function(runningTask, proxy)
 	local dataStore = getmetatable(proxy)
-	local response, responseData = Load(dataStore, 3)
-	if response ~= "Success" then for thread in runningTask:Iterate() do task.defer(thread, response, responseData) end return end
 	local response, responseData = Lock(dataStore, 3)
 	if response ~= "Success" then for thread in runningTask:Iterate() do task.defer(thread, response, responseData) end return end
+	local response, responseData = Load(dataStore, 3)
+	if response ~= "Success" then Unlock(dataStore, 3) for thread in runningTask:Iterate() do task.defer(thread, response, responseData) end return end
 	dataStore.__public.State = true
 	if dataStore.TaskManager:FindLast(CloseTask) == nil and dataStore.TaskManager:FindLast(DestroyTask) == nil then
 		StartSaveTimer(proxy)
@@ -411,30 +415,39 @@ CloseTask = function(runningTask, proxy)
 	local dataStore = getmetatable(proxy)
 	if dataStore.__public.State == false then for thread in runningTask:Iterate() do task.defer(thread) end return end
 	dataStore.__public.State = false
-	local response = "Success"
-	if dataStore.__public.SaveOnClose == true and Save(proxy, 3) == "Saved" then response = "Saved" end
+	local response, responseData = nil, nil
+	if dataStore.__public.SaveOnClose == true then response, responseData = Save(proxy, 3) end
 	Unlock(dataStore, 3)
 	dataStore.__public.StateChanged:Fire(false, proxy)
-	for thread in runningTask:Iterate() do task.defer(thread, response) end
+	if response == "Saved" then
+		for thread in runningTask:Iterate() do task.defer(thread, response, responseData) end
+	else
+		for thread in runningTask:Iterate() do task.defer(thread, "Success") end
+	end
 end
 
 DestroyTask = function(runningTask, proxy)
 	local dataStore = getmetatable(proxy)
-	local response = "Success"
+	local response, responseData = nil, nil
 	if dataStore.__public.State == false then
 		dataStore.__public.State = nil
 	else
 		dataStore.__public.State = nil
-		if dataStore.__public.SaveOnClose == true and Save(proxy, 3) == "Saved" then response = "Saved" end
+		if dataStore.__public.SaveOnClose == true then response, responseData = Save(proxy, 3) end
 		Unlock(dataStore, 3)
 	end
 	dataStore.__public.StateChanged:Fire(nil, proxy)
 	dataStore.__public.StateChanged:DisconnectAll()
 	dataStore.__public.Saving:DisconnectAll()
+	dataStore.__public.Saved:DisconnectAll()
 	dataStore.__public.AttemptsChanged:DisconnectAll()
 	dataStore.__public.ProcessQueue:DisconnectAll()
 	bindToClose[dataStore.__public.UniqueId] = nil
-	for thread in runningTask:Iterate() do task.defer(thread, response) end
+	if response == "Saved" then
+		for thread in runningTask:Iterate() do task.defer(thread, response, responseData) end
+	else
+		for thread in runningTask:Iterate() do task.defer(thread, "Success") end
+	end
 end
 
 Lock = function(dataStore, attempts)
@@ -500,7 +513,7 @@ Save = function(proxy, attempts)
 			success, value, info = pcall(dataStore.DataStore.RemoveAsync, dataStore.DataStore, dataStore.__public.Key)
 			if success == true then break end
 		end
-		if success == false then return "Error", value end
+		if success == false then dataStore.__public.Saved:Fire("Error", value, proxy) return "Error", value end
 		dataStore.__public.Metadata, dataStore.__public.UserIds, dataStore.__public.CreatedTime, dataStore.__public.UpdatedTime, dataStore.__public.Version = {}, {}, 0, 0, ""
 	elseif type(dataStore.__public.Metadata.Compress) ~= "table" then
 		dataStore.Options:SetMetadata(dataStore.__public.Metadata)
@@ -509,7 +522,7 @@ Save = function(proxy, attempts)
 			success, value = pcall(dataStore.DataStore.SetAsync, dataStore.DataStore, dataStore.__public.Key, dataStore.__public.Value, dataStore.__public.UserIds, dataStore.Options)
 			if success == true then break end
 		end	
-		if success == false then return "Error", value end
+		if success == false then dataStore.__public.Saved:Fire("Error", value, proxy) return "Error", value end
 		dataStore.__public.Version = value
 	else
 		local level = dataStore.__public.Metadata.Compress.Level or 2
@@ -522,11 +535,12 @@ Save = function(proxy, attempts)
 			success, value = pcall(dataStore.DataStore.SetAsync, dataStore.DataStore, dataStore.__public.Key, dataStore.__public.CompressedValue, dataStore.__public.UserIds, dataStore.Options)
 			if success == true then break end
 		end
-		if success == false then return "Error", value end
+		if success == false then dataStore.__public.Saved:Fire("Error", value, proxy) return "Error", value end
 		dataStore.Version = value
 	end
 	dataStore.SaveTime = os.clock()
-	return "Saved"
+	dataStore.__public.Saved:Fire("Saved", dataStore.__public.Value, proxy)
+	return "Saved", dataStore.__public.Value
 end
 
 StartSaveTimer = function(proxy)
